@@ -8,7 +8,7 @@ from data import *
 # This file consists of evaluation code adapted from Jia + Liang, wrapping predictions and sending them to a Java
 # backend for evaluation against the knowledge base.
 
-def evaluate(test_data: List[Example], decoder, example_freq=50, print_output=True, outfile=None, use_java=True):
+def evaluate(test_data: List[Example], decoder, example_freq=10, print_output=True, outfile=None, use_java=True):
     """
     Evaluates decoder against the data in test_data (could be dev data or test data). Prints some output
     every example_freq examples. Writes predictions to outfile if defined. Evaluation requires

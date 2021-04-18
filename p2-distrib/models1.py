@@ -1,5 +1,4 @@
 import math
-import time
 
 import torch
 import torch.nn as nn
@@ -74,7 +73,7 @@ class NearestNeighborSemanticParser(object):
 ###################################################################################################################
 
 class Seq2SeqSemanticParser(nn.Module):
-    def __init__(self, input_indexer, output_indexer, emb_dim, hidden_size, embedding_dropout=0.1,
+    def __init__(self, input_indexer, output_indexer, emb_dim, hidden_size, embedding_dropout=0.0,
                  bidirect=True, teacher_forcing_prob=0.8):
         # We've include some args for setting up the input embedding and encoder
         # You'll need to add code for output embedding and decoder
@@ -86,7 +85,7 @@ class Seq2SeqSemanticParser(nn.Module):
 
         self.input_emb = EmbeddingLayer(emb_dim, len(input_indexer), embedding_dropout)
         self.encoder = RNNEncoder(emb_dim, hidden_size, bidirect)
-        self.decoder = BahdanauAttnDecoder(hidden_size, emb_dim, len(output_indexer), embedding_dropout)
+        self.decoder = AttentionDecoder(emb_dim, hidden_size, len(output_indexer))
         self.loss_func = nn.NLLLoss(ignore_index=0)
 
     def forward(self, x_tensor, inp_lens_tensor, y_tensor, out_lens_tensor, inp, batch_size):
@@ -127,8 +126,6 @@ class Seq2SeqSemanticParser(nn.Module):
 
     def decode(self, test_data: List[Example]) -> List[List[Derivation]]:
         self.eval()
-        self.encoder.eval()
-        self.decoder.eval()
         answer = []
         for i, ex in enumerate(test_data):
             x = np.array([ex.x_indexed])
@@ -143,8 +140,10 @@ class Seq2SeqSemanticParser(nn.Module):
             predicted = []
             while token != "<EOS>" and idx < 70:
                 # print(i, input.shape, input)
-                output, hn, cn = self.decoder(input, hn, cn, enc_outputs, context_mask)
-                input = torch.argmax(output, dim=1)
+                output, hn = self.decoder(input, hn, enc_outputs, context_mask)
+                # print(output)
+                input = torch.argmax(output, dim=2).squeeze(0)
+                # print(input)
                 prob = torch.max(output)
                 token = self.output_indexer.get_object(input.item())
                 if token != "<EOS>":
@@ -152,9 +151,7 @@ class Seq2SeqSemanticParser(nn.Module):
                 idx += 1
             # print(predicted)
             answer.append([Derivation(ex, prob, predicted)])
-        self.train()
-        self.encoder.train()
-        self.decoder.train()
+
         return answer
 
     def encode_input(self, x_tensor, inp_lens_tensor):
@@ -218,7 +215,7 @@ class EmbeddingLayer(nn.Module):
 class RNNDecoder(nn.Module):
     def __init__(self, emb_dim, hidden, output, embedding_dropout=0):
         super(RNNDecoder, self).__init__()
-        self.embedding = EmbeddingLayer(emb_dim, output, embedding_dropout)
+        self.embedding = nn.Embedding(output, emb_dim)
         self.W = nn.Linear(hidden, output)
         self.rnn = nn.LSTM(emb_dim, hidden, num_layers=1, batch_first=False)
         self.softmax = nn.Softmax()
@@ -230,65 +227,106 @@ class RNNDecoder(nn.Module):
         return self.W(output), hn, cn
 
 
-class Attn(nn.Module):
-    def __init__(self, method, hidden_size):
-        super(Attn, self).__init__()
-        self.method = method
-        self.hidden_size = hidden_size
-        self.attn = nn.Linear(self.hidden_size * 2, hidden_size)
-        self.v = nn.Parameter(torch.rand(hidden_size))
-        stdv = 1. / math.sqrt(self.v.size(0))
-        self.v.data.normal_(mean=0, std=stdv)
+class AttentionDecoder(nn.Module):
+    def __init__(self, emb_dim, hidden, output, embedding_dropout=0):
+        super(AttentionDecoder, self).__init__()
+        self.embedding = EmbeddingLayer(emb_dim, output, embedding_dropout)
+        # self.dropout = nn.Dropout(embedding_dropout)
+        self.W = nn.Linear(hidden, output)
+        self.rnn = nn.GRU(emb_dim, hidden, num_layers=1, batch_first=False)
+        self.attn = nn.Linear(hidden, hidden)
+        self.combine = nn.Linear(hidden * 2, hidden)
+        self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, hidden, encoder_outputs, mask):
-        max_len = encoder_outputs.size(0)
-        H = hidden.repeat(max_len, 1, 1).transpose(0, 1)
-        encoder_outputs = encoder_outputs.transpose(0, 1)
-        attn_weights = self.score(H, encoder_outputs)
-        attn_weights = attn_weights.masked_fill(mask == 0, -1e18)
-        return F.softmax(attn_weights, dim=1).unsqueeze(1)
+    def scoring(self, encoder_output, hidden, mask):
+        """
+        :param encoder_output: [input_seq_len x batch_size x hidden_size]
+        :param hidden: [1 x batch_size x hidden_size]
+        :param mask: [batch_size x input_seq_len]
+        :return:
 
-    def score(self, hidden, encoder_outputs):
-        e = F.tanh(self.attn(torch.cat([hidden, encoder_outputs], 2)))
-        e = e.transpose(2, 1)
-        v = self.v.repeat(encoder_outputs.data.shape[0], 1).unsqueeze(1)
-        e = torch.bmm(v, e)
-        return e.squeeze(1)
+        scores: [batch_size x input_seq_len]
+
+        """
+        scores = torch.bmm(hidden.transpose(0, 1), self.attn(encoder_output).permute(1, 2, 0)) # [batch_size x 1 x input_seq_len]
+        scores = scores.squeeze(1)
+        # print(scores.shape)
+        scores = scores.masked_fill_(mask==0, -1e18)
+        return self.softmax(scores)
+
+    def forward(self, input_seq, hidden, encoder_outputs, mask):
+        embeddings = self.embedding(input_seq.unsqueeze(0))
+        # print(embeddings.shape)
+        # print(hidden.shape)
+        # attentions = F.softmax(torch.cat((embeddings, hidden))) # self.scoring(encoder_outputs, output, mask)
+        output, hidden = self.rnn(embeddings, hidden)
+        # print(hidden.shape, encoder_outputs.shape, mask.shape)
+        attentions = self.scoring(encoder_outputs, hidden, mask)
+        # print('attentions', attentions.shape, encoder_outputs.shape)
+        context = torch.bmm(attentions.unsqueeze(1), encoder_outputs.transpose(0, 1)).transpose(0, 1)
+        # print('context', context.shape, context)
+        # print('output', output.shape, output)
+        probs = self.W(self.combine(torch.cat((context, hidden), 2)))
+        # print('probs', probs.shape, probs)
+        # input()
+        return probs, hidden
 
 
-class BahdanauAttnDecoder(nn.Module):
-    def __init__(self, hidden_size, emb_size, output_size, dropout=0.0, n_layers=1):
-        super(BahdanauAttnDecoder, self).__init__()
-        self.hidden_size = hidden_size
-        self.emb_size = emb_size
-        self.output_size = output_size
-        self.n_layers = n_layers
-        self.dropout = dropout
-
-        self.embedding = nn.Embedding(output_size, emb_size)
-        self.dropout = nn.Dropout(dropout)
-        self.attn = Attn('concat', hidden_size)
-        self.lstm = nn.LSTM(hidden_size + emb_size, hidden_size, n_layers, dropout=dropout)
-        self.out = nn.Linear(hidden_size, output_size)
-
-    def forward(self, word_input, last_hidden, last_cell, encoder_outputs, mask, printout=False):
-        word_embeddings = self.dropout(
-            self.embedding(word_input).view(1, word_input.size(0), -1))  # CHANGE THIS word_input.size(0)
-        # print(word_embeddings.shape)
-        attn_weights = self.attn(last_hidden[-1], encoder_outputs, mask)
-        # print(attn_weights.shape, encoder_outputs.shape)
-        if printout:
-            print(attn_weights)
-        context = attn_weights.bmm(encoder_outputs.transpose(0, 1))
-        # print(context.shape)
-        context = context.transpose(0, 1)
-        # print(context.shape)
-        rnn_input = torch.cat((word_embeddings, context), 2)
-        output, (hidden, cell) = self.lstm(rnn_input, (last_hidden, last_cell))
-        output = output.squeeze(0)
-        output = F.log_softmax(self.out(output), dim=1)
-
-        return output, hidden, cell
+# class AttentionDecoder(nn.Module):
+#     def __init__(self, emb_dim, hidden, output, embedding_dropout=0):
+#         super(AttentionDecoder, self).__init__()
+#         self.embedding = nn.Embedding(output, emb_dim)
+#         self.dropout = nn.Dropout(embedding_dropout)
+#         self.W = nn.Linear(hidden, output)
+#         self.rnn = nn.GRU(emb_dim, hidden, num_layers=1, batch_first=False)
+#         self.attn = nn.Linear(hidden, hidden)
+#         self.combine = nn.Linear(hidden * 2, hidden)
+#         self.softmax = nn.Softmax(dim=1)
+#
+#     def scoring(self, encoder_output, hidden, mask):
+#         """
+#         :param encoder_output: [input_seq_len x batch_size x hidden_size]
+#         :param hidden: [1 x batch_size x hidden_size]
+#         :param mask: [batch_size x input_seq_len]
+#         :return:
+#
+#         scores: [batch_size x input_seq_len]
+#
+#         """
+#         # print(mask.shape)
+#         # encoder_out_len, batch_size, _ = encoder_output.size()
+#         # scores = torch.zeros(batch_size, encoder_out_len)
+#         # print(hidden.shape, encoder_output.shape)
+#         scores = torch.bmm(hidden.transpose(0, 1), self.attn(encoder_output).permute(1, 2, 0)) # [batch_size x 1 x input_seq_len]
+#         # print(scores.shape, scores)
+#         # print(mask, scores.squeeze(1))
+#         scores = scores.squeeze(1) * mask
+#         # scores = scores.squeeze(1)
+#         # print(scores)
+#         # print("softmax'd scores", self.softmax(scores).shape, self.softmax(scores))
+#         # input()
+#         return self.softmax(scores)
+#
+#     def forward(self, input_seq, hidden, encoder_outputs, mask):
+#         # print(input_seq.shape)
+#         embeddings = self.embedding(input_seq.unsqueeze(0))
+#         embeddings = self.dropout(embeddings)
+#         # print(embeddings.shape)
+#
+#         attentions = F.softmax(torch.cat((embeddings, hidden))) # self.scoring(encoder_outputs, output, mask)
+#         output, hidden = self.rnn(embeddings, hidden)
+#         # attn_weights =
+#         # print(output, hn)
+#
+#         # attentions = self.scoring(encoder_outputs, output, mask)
+#         # print('attentions', attentions.shape, attentions)
+#         context = torch.bmm(attentions.unsqueeze(1), encoder_outputs.transpose(0, 1)).transpose(0, 1)
+#         # print('context', context.shape, context)
+#         # print('output', output.shape, output)
+#         probs = self.W(self.combine(torch.cat((context, hidden), 2)))
+#         # print('probs', probs.shape, probs)
+#         # input()
+#         return probs, hidden
 
 
 class RNNEncoder(nn.Module):
@@ -424,26 +462,27 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
         print("Train output length: %i" % np.max(np.asarray([len(ex.y_indexed) for ex in train_data])))
         print("Train matrix: %s; shape = %s" % (all_train_input_data, all_train_input_data.shape))
 
-    hidden_size = 200
-    batch_size = 16
-    embedding_size = 200
-    epochs = 50
+    hidden_size = 512
+    batch_size = 20
+    embedding_size = 512
+    epochs = 20
     model = Seq2SeqSemanticParser(input_indexer, output_indexer, embedding_size, hidden_size)
-    initial_lr = 0.001
+    initial_lr = 0.002
     enc_optm = optim.Adam(model.encoder.parameters(), lr=initial_lr)
     dec_optm = optim.Adam(model.decoder.parameters(), lr=initial_lr)
-    criterion = nn.NLLLoss(ignore_index=0)
-    start = time.time()
+    criterion = nn.CrossEntropyLoss()
+
     for epoch in range(epochs):
         total_loss = 0.0
-
         # random.shuffle(all_train_input_data)
-        # z = list(zip(all_train_input_data, all_train_output_data))
-        # random.shuffle(z)
-        # all_train_input_data[:], all_train_output_data[:] = zip(*z)
+        z = list(zip(all_train_input_data, all_train_output_data))
+        random.shuffle(z)
+        all_train_input_data[:], all_train_output_data[:] = zip(*z)
 
         batch_index = batch_size
         while batch_index < len(all_train_input_data):
+            # enc_optm.zero_grad()
+            # dec_optm.zero_grad()
             batch_x = all_train_input_data[batch_index - batch_size:batch_index]
             batch_y = all_train_output_data[batch_index - batch_size:batch_index]
             x_tensor = torch.from_numpy(batch_x).long()
@@ -452,13 +491,20 @@ def train_model_encdec(train_data: List[Example], dev_data: List[Example], input
             out_lens_tensor = torch.from_numpy(np.sum(batch_y != 0, axis=1)).long()
 
             loss = batching(x_tensor, inp_lens_tensor, y_tensor, out_lens_tensor, model.encoder, model.decoder, enc_optm, dec_optm, output_max_len, batch_size, model.output_indexer, criterion, model)
+            # inp = torch.full([batch_size], output_indexer.index_of("<SOS>")).long()
+            # # print(inp)
+            # outputs = model(x_tensor, inp_lens_tensor, y_tensor, output_max_len, inp, batch_size)
+            # loss = criterion(outputs.view(batch_size*output_max_len, len(output_indexer)), y_tensor.view(batch_size*output_max_len))
+            # loss.backward()
+            # enc_optm.step()
+            # dec_optm.step()
+
             total_loss += loss.item()
             batch_index += batch_size
 
         print(total_loss)
     # First create a model. Then loop over epochs, loop over examples, and given some indexed words
     # call your seq-to-seq model, accumulate losses, update parameters
-    print(time.time() - start)
     return model
 
 
@@ -469,10 +515,12 @@ def batching(input_batches, input_lengths, target_batches, target_lengths, encod
 
     enc_optm.zero_grad()
     dec_optm.zero_grad()
+    # criterion = nn.NLLLoss()
+    # loss = 0
     enc_outputs, context_mask, enc_hidden = model.encode_input(input_batches, input_lengths)
 
     dec_inp = Variable(torch.LongTensor([SOS_tok] * batch_size))
-    dec_hid, dec_cell = enc_hidden
+    dec_hid = enc_hidden[0]
 
     max_target_length = max(target_lengths)
 
@@ -482,21 +530,25 @@ def batching(input_batches, input_lengths, target_batches, target_lengths, encod
 
     if teacher_forced:
         for i in range(max_target_length):
-            dec_output, dec_hid, dec_cell = decoder(dec_inp, dec_hid, dec_cell, enc_outputs, context_mask)
+            dec_output, dec_hid = decoder(dec_inp, dec_hid, enc_outputs, context_mask)
             dec_outputs[i] = dec_output
             dec_inp = target_batches[:, i]
+            # print(dec_inp, "teacher forced!!!!!!!!!!!!!")
     else:
         num_EOS = 0
         for i in range(max_target_length):
-            dec_output, dec_hid, dec_cell = decoder(dec_inp, dec_hid, dec_cell, enc_outputs, context_mask)
+            dec_output, dec_hid = decoder(dec_inp, dec_hid, enc_outputs, context_mask)
             topv, topi = dec_output.data.topk(1)
             if EOS_tok in topi:
                 num_EOS += 1
                 if num_EOS == batch_size:
                     break
+            # print(dec_output.shape, dec_output)
             dec_outputs[i] = dec_output
-            dec_inp = Variable(torch.LongTensor(topi.squeeze(1)))
+            dec_inp = torch.flatten(Variable(torch.LongTensor(topi.squeeze(1))))
+            # print(dec_inp, "not teacher forced")
 
+    # print(dec_outputs.shape, target_batches.shape)
     loss = criterion(dec_outputs.transpose(1, 2), target_batches.transpose(0, 1))
     loss.backward()
 
